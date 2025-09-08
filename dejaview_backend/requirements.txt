@@ -1,0 +1,8 @@
+flask
+flask-cors
+sentence-transformers
+numpy
+chromadb
+typing-extensions
+requests
+

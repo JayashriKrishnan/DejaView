@@ -1,0 +1,24 @@
+{
+  "manifest_version": 3,
+  "name": "DejaView",
+  "version": "1.0",
+  "description": "Smartly capture browsing paragraphs and send to backend.",
+  "permissions": ["scripting", "activeTab"],
+  "host_permissions": ["http://localhost:5000/*"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["readability.js", "content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html"
+  },
+  "icons": {
+    "128": "icon.png"
+  }
+}
