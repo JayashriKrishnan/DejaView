@@ -3,8 +3,8 @@
   "name": "DejaView",
   "version": "1.0",
   "description": "Smartly capture browsing paragraphs and send to backend.",
-  "permissions": ["scripting", "activeTab"],
-  "host_permissions": ["http://localhost:5000/*"],
+  "permissions": ["scripting", "activeTab", "tabs"],
+  "host_permissions": ["http://localhost:5000/*", "http://127.0.0.1:5000/*"],
   "background": {
     "service_worker": "background.js"
   },
@@ -18,6 +18,12 @@
   "action": {
     "default_popup": "popup.html"
   },
+  "web_accessible_resources": [
+    {
+      "resources": ["dashboard/*"],
+      "matches": ["<all_urls>"]
+    }
+  ],
   "icons": {
     "128": "icon.png"
   }

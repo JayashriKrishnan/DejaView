@@ -6,6 +6,5 @@ chromadb
 typing-extensions
 requests
 openai
-python-dotenv
 tzdata
 

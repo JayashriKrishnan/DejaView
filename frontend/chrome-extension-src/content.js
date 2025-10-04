@@ -21,6 +21,13 @@
       .split("\n")
       .map(p => p.trim())
       .filter(p => p.length > 50) // drop tiny lines
+      .flatMap(p => {
+        // Split paragraphs longer than 1000 characters
+        if (p.length > 1000) {
+          return p.match(/.{1,1000}/g) || [p];
+        }
+        return [p];
+      })
       .map((p, i) => ({ index: i, text: p }));
 
     chrome.runtime.sendMessage({

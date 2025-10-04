@@ -77,9 +77,40 @@ def init_db():
     except Exception:
         # Best-effort migration; continue without breaking app
         pass
+
+    # Create FTS5 index for paragraphs to support BM25 keyword search
+    try:
+        c.execute("CREATE VIRTUAL TABLE IF NOT EXISTS paragraphs_fts USING fts5(text, content='paragraphs', content_rowid='id')")
+        # Backfill any missing FTS rows (one-time, idempotent-ish)
+        c.execute("INSERT INTO paragraphs_fts(rowid, text) SELECT id, text FROM paragraphs WHERE id NOT IN (SELECT rowid FROM paragraphs_fts)")
+        conn.commit()
+    except Exception:
+        # If FTS5 not available, skip; hybrid search will degrade gracefully
+        pass
     conn.close()
 
 init_db()
+
+# Auto-backfill missing data on startup (only if needed)
+def auto_backfill_on_startup():
+    """Ensure all SQLite data is also in ChromaDB - only run if ChromaDB is empty"""
+    try:
+        # Check if ChromaDB has any data
+        existing_data = collection.get(include=['metadatas'])
+        if existing_data.get('metadatas') and len(existing_data['metadatas']) > 0:
+            print("ChromaDB already has data, skipping auto-backfill")
+            return
+        
+        print("ChromaDB is empty, running auto-backfill...")
+        from auto_backfill import auto_backfill
+        auto_backfill()
+    except Exception as e:
+        print(f"Auto-backfill failed: {e}")
+
+# Run backfill in background on startup (only if needed)
+import threading
+backfill_thread = threading.Thread(target=auto_backfill_on_startup, daemon=True)
+backfill_thread.start()
 
 # ---- Endpoints ----
 @app.route("/capture", methods=["POST"])
@@ -115,13 +146,31 @@ def capture():
     conn.commit()
     conn.close()
 
-    # Insert into Chroma (id, embedding, metadata)
-    collection.add(
-        ids=paragraph_ids,
-        embeddings=embeddings,
-        metadatas=[{"url": url, "title": title, "timestamp": timestamp, "paragraph_index": p.get("index", idx)} for idx, p in enumerate(paragraphs)],
-        documents=texts
-    )
+    # Insert into Chroma (id, embedding, metadata) with error handling
+    chroma_success = False
+    chroma_error = None
+    for attempt in range(3):
+        try:
+            collection.add(
+                ids=paragraph_ids,
+                embeddings=embeddings,
+                metadatas=[{
+                    "url": url, 
+                    "title": title, 
+                    "timestamp": timestamp, 
+                    "paragraph_index": p.get("index", idx),
+                    "page_id": page_id
+                } for idx, p in enumerate(paragraphs)],
+                documents=texts
+            )
+            chroma_success = True
+            print(f"Successfully stored {len(paragraphs)} paragraphs in ChromaDB for page {page_id}")
+            break
+        except Exception as e:
+            chroma_error = str(e)
+            print(f"Error storing in ChromaDB (attempt {attempt+1}): {e}")
+    if not chroma_success:
+        print(f"Failed to store in ChromaDB after 3 attempts: {chroma_error}")
 
     return jsonify({"status": "success", "stored_paragraphs": len(paragraphs)}), 200
 
@@ -130,22 +179,94 @@ def capture():
 def search():
     body = request.get_json(force=True)
     query = body.get("query", "")
-    top_k = int(body.get("top_k", 5))
+    top_k = int(body.get("top_k", 20))
+    min_similarity = float(body.get("min_similarity", -0.5))  # Lower default threshold for negative similarities
+    from_date: Optional[str] = body.get("from_date")  # ISO date prefix e.g. "2025-10-01"
+    to_date: Optional[str] = body.get("to_date")
+    prefer_recent: bool = bool(body.get("prefer_recent", True))
+    recency_boost: float = float(body.get("recency_boost", 0.5))  # 0..1 reasonable
 
     if not query:
         return jsonify({"status": "error", "message": "query required"}), 400
 
-    q_emb = model.encode([query], convert_to_numpy=True).tolist()[0]
+    # Prepare date bounds (will filter results in Python)
+    lower = f"{from_date}T00:00:00" if from_date and "T" not in from_date else from_date
+    upper = f"{to_date}T23:59:59" if to_date and "T" not in to_date else to_date
 
+    # Simple query expansion for synonyms/acronyms (helps AI vs Artificial Intelligence, ML vs Machine Learning)
+    synonyms_map = {
+        "artificial intelligence": ["ai"],
+        "ai": ["artificial intelligence"],
+        "machine learning": ["ml"],
+        "ml": ["machine learning"],
+        "natural language processing": ["nlp"],
+        "nlp": ["natural language processing"],
+        "database": ["db"],
+        "sql": ["structured query language"],
+    }
+    expanded_queries: List[str] = [query]
+    q_lower = query.lower()
+    for key, syns in synonyms_map.items():
+        if key in q_lower and syns:
+            expanded_queries.extend(syns)
+
+    # Average the embeddings of expanded terms for a more robust query vector
+    q_vecs = model.encode(expanded_queries, convert_to_numpy=True)
+    q_emb = np.mean(q_vecs, axis=0).tolist()
+
+    # If date filter present, widen retrieval so post-filtering still has enough hits
+    n_fetch = max(top_k * 10, 200) if (from_date or to_date) else top_k
     results = collection.query(
         query_embeddings=[q_emb],
-        n_results=top_k
+        n_results=n_fetch,
+        include=["documents", "metadatas", "distances"]
     )
 
-    # Format results
     formatted = []
-    for ids, docs, metas in zip(results["ids"], results["documents"], results["metadatas"]):
-        for pid, doc, meta in zip(ids, docs, metas):
+    ids_list = results.get("ids", []) or []
+    docs_list = results.get("documents", []) or []
+    metas_list = results.get("metadatas", []) or []
+    dists_list = results.get("distances", []) or []
+
+    # Helper to parse ISO timestamps uniformly (supports trailing Z and offsets)
+    def _parse_iso(ts: Optional[str]) -> Optional[datetime]:
+        if not ts:
+            return None
+        try:
+            if ts.endswith("Z"):
+                ts = ts[:-1] + "+00:00"
+            return datetime.fromisoformat(ts)
+        except Exception:
+            return None
+
+    # Compute a recency score with ~7-day half-life
+    now = datetime.now(ZoneInfo("Asia/Kolkata"))
+    half_life_days = 7.0
+    ln2 = 0.69314718056
+    decay = ln2 / half_life_days
+
+    for ids, docs, metas, dists in zip(ids_list, docs_list, metas_list, dists_list):
+        for pid, doc, meta, dist in zip(ids, docs, metas, dists):
+            # ChromaDB returns cosine distances, convert to similarity
+            # Distance 0 = perfect match (similarity 1), Distance 2 = opposite (similarity -1)
+            similarity = 1 - float(dist) if dist is not None else None
+            # Date filter in Python (timestamps are ISO strings)
+            if lower and meta.get("timestamp") and meta["timestamp"] < lower:
+                continue
+            if upper and meta.get("timestamp") and meta["timestamp"] > upper:
+                continue
+            # Don't filter by similarity if it's negative - just use a lower threshold
+            if similarity is not None and similarity < max(min_similarity, -0.5):
+                continue
+            # Recency boost
+            combined_score = similarity if similarity is not None else 0.0
+            if prefer_recent:
+                ts_dt = _parse_iso(meta.get("timestamp"))
+                if ts_dt is not None:
+                    age_days = max((now - ts_dt).total_seconds(), 0.0) / 86400.0
+                    recency_score = np.exp(-decay * age_days)
+                    combined_score = similarity * (1.0 + recency_boost * recency_score)
+
             formatted.append({
                 "paragraph_id": pid,
                 "text": doc,
@@ -153,7 +274,65 @@ def search():
                 "title": meta.get("title"),
                 "timestamp": meta.get("timestamp"),
                 "paragraph_index": meta.get("paragraph_index"),
+                "similarity_score": round(similarity, 3) if similarity is not None else None,
+                "combined_score": round(combined_score, 3),
             })
+
+    # --- BM25 keyword search via SQLite FTS5 (optional, fast) ---
+    bm25_results = []
+    try:
+        conn2 = sqlite3.connect(DB_FILE)
+        c2 = conn2.cursor()
+        # Use FTS5 to match query terms; limit breadth, then we’ll merge
+        c2.execute("SELECT p.id, p.page_id, p.paragraph_index, p.text FROM paragraphs p JOIN paragraphs_fts f ON p.id = f.rowid WHERE paragraphs_fts MATCH ? LIMIT ?", (query, n_fetch))
+        rows = c2.fetchall()
+        conn2.close()
+        for rid, page_id, pidx, text in rows:
+            # Lookup page metadata for URL/title/timestamp
+            conn3 = sqlite3.connect(DB_FILE)
+            c3 = conn3.cursor()
+            c3.execute("SELECT url, title, timestamp FROM pages WHERE id = ?", (page_id,))
+            pr = c3.fetchone()
+            conn3.close()
+            if not pr:
+                continue
+            url, title, ts = pr
+            # Apply date bounds here too
+            if lower and ts and ts < lower:
+                continue
+            if upper and ts and ts > upper:
+                continue
+            bm25_results.append({
+                "paragraph_id": str(rid),
+                "text": text,
+                "url": url,
+                "title": title,
+                "timestamp": ts,
+                "paragraph_index": pidx,
+                "bm25": 1.0  # presence marker; we’ll weight on merge
+            })
+    except Exception:
+        pass
+
+    # Merge semantic + BM25: prefer recency+similarity, but add BM25 hits not already included
+    seen_ids = set(r["paragraph_id"] for r in formatted)
+    for r in bm25_results:
+        if r["paragraph_id"] not in seen_ids:
+            # Assign a conservative combined score for BM25-only hits
+            r["similarity_score"] = r.get("similarity_score") or 0.4
+            r["combined_score"] = r.get("combined_score") or (0.4 + (0.1 if prefer_recent else 0.0))
+            formatted.append(r)
+
+    # Trim to requested top_k after filtering (by combined score if recency preferred)
+    key_field = "combined_score" if prefer_recent else "similarity_score"
+    formatted = sorted(formatted, key=lambda x: x.get(key_field) or 0, reverse=True)[:top_k]
+
+    if not formatted:
+        return jsonify({
+            "status": "no_results",
+            "message": "No content found for the given filters. Try widening the date range or lowering min_similarity.",
+            "results": []
+        }), 200
 
     return jsonify(formatted), 200
 
@@ -338,6 +517,65 @@ def summarize_query():
         "summary": summary,
         "used_paragraph_ids": used_paragraph_ids
     })
+
+
+@app.route("/backfill_recent", methods=["POST"])
+def backfill_recent():
+    """Re-embed paragraphs from the most recent pages into Chroma.
+    Useful if Chroma missed inserts earlier. Idempotent by checking existing ids.
+    """
+    limit = int(request.args.get("limit", "20"))
+
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT id, url, title, timestamp FROM pages ORDER BY id DESC LIMIT ?", (limit,))
+    pages = c.fetchall()
+
+    reinserted = 0
+    for page_id, url, title, ts in pages:
+        c.execute("SELECT id, paragraph_index, text FROM paragraphs WHERE page_id = ? ORDER BY paragraph_index ASC", (page_id,))
+        rows = c.fetchall()
+        if not rows:
+            continue
+
+        paragraph_ids = [str(r[0]) for r in rows]
+        texts = [r[2] for r in rows]
+
+        # Filter out ids that already exist in Chroma
+        try:
+            existing = collection.get(ids=paragraph_ids)
+            existing_ids = set(existing.get("ids", []) or [])
+        except Exception:
+            existing_ids = set()
+
+        new_ids = []
+        new_texts = []
+        new_embeddings = []
+        new_metas = []
+        for pid, text, row in zip(paragraph_ids, texts, rows):
+            if pid in existing_ids:
+                continue
+            new_ids.append(pid)
+            new_texts.append(text)
+            new_embeddings.append(model.encode([text], convert_to_numpy=True).tolist()[0])
+            new_metas.append({
+                "url": url,
+                "title": title,
+                "timestamp": ts,
+                "paragraph_index": row[1]
+            })
+
+        if new_ids:
+            collection.add(
+                ids=new_ids,
+                embeddings=new_embeddings,
+                metadatas=new_metas,
+                documents=new_texts
+            )
+            reinserted += len(new_ids)
+
+    conn.close()
+    return jsonify({"status": "success", "reinserted": reinserted})
 
 if __name__ == "__main__":
     app.run(port=5000, debug=True)
