@@ -1,6 +1,6 @@
 import axios from 'axios';
 
-const API_BASE_URL = 'http://localhost:5000'; // Your Flask backend URL
+const API_BASE_URL = 'http://127.0.0.1:5000'; // Your Flask backend URL
 
 // Function to fetch all recent pages
 export const fetchAllPages = async () => {
@@ -53,6 +53,17 @@ export const summarizeQuery = async (query, top_k = 5) => {
     return response.data;
   } catch (error) {
     console.error(`Error summarizing query '${query}':`, error);
+    throw error;
+  }
+};
+
+// Function to get RAG answer
+export const getRagAnswer = async (query, top_k = 5) => {
+  try {
+    const response = await axios.post(`${API_BASE_URL}/rag_answer`, { query, top_k });
+    return response.data;
+  } catch (error) {
+    console.error(`Error getting RAG answer for '${query}':`, error);
     throw error;
   }
 };

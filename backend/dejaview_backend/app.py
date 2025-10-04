@@ -577,5 +577,65 @@ def backfill_recent():
     conn.close()
     return jsonify({"status": "success", "reinserted": reinserted})
 
+
+@app.route("/rag_answer", methods=["POST"])
+def rag_answer():
+    body = request.get_json(force=True)
+    query = body.get("query", "").strip()
+    top_k = int(body.get("top_k", 5))
+    if not query:
+        return jsonify({"status": "error", "message": "query required"}), 400
+
+    # Embed query and retrieve top paragraphs
+    q_emb = model.encode([query], convert_to_numpy=True).tolist()[0]
+    results = collection.query(query_embeddings=[q_emb], n_results=top_k, include=["documents", "metadatas", "distances"])
+
+    docs = []
+    sources = []
+    key_takeaway = ""
+    filtered_docs = []
+    filtered_sources = []
+    # Only use paragraphs from 2024 onwards
+    min_year = 2024
+    if results and results.get("documents"):
+        for ids, docs_list, metas_list in zip(results.get("ids", []), results.get("documents", []), results.get("metadatas", [])):
+            for pid, doc, meta in zip(ids, docs_list, metas_list):
+                ts = meta.get("timestamp")
+                year_ok = True
+                if ts:
+                    try:
+                        year = int(ts[:4])
+                        year_ok = year >= min_year
+                    except Exception:
+                        year_ok = True
+                if year_ok:
+                    filtered_docs.append(doc)
+                    src = meta.get("url") or meta.get("title") or "Unknown Source"
+                    filtered_sources.append(src)
+
+    if not filtered_docs:
+        return jsonify({
+            "ai_answer": "No recent relevant content found.",
+            "sources": [],
+            "key_takeaway": ""
+        })
+
+    # Organize answer: join paragraphs with double newlines for clarity
+    try:
+        answer = summarize_texts(filtered_docs, max_words=180)
+        answer = '\n\n'.join([p.strip() for p in answer.split('. ') if p.strip()])
+        key_takeaway = answer.split('\n')[0] if answer else ""
+        return jsonify({
+            "ai_answer": answer,
+            "sources": filtered_sources,
+            "key_takeaway": key_takeaway
+        })
+    except Exception as e:
+        return jsonify({
+            "ai_answer": f"Error generating answer: {str(e)}",
+            "sources": filtered_sources,
+            "key_takeaway": ""
+        })
+
 if __name__ == "__main__":
     app.run(port=5000, debug=True)
